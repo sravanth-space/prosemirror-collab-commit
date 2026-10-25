@@ -77,10 +77,11 @@ export function neutralizeSteps(steps: readonly Step[]) {
 /// Undo a given set of steps, apply a set of other steps, and then
 /// redo them @internal
 export function rebaseSteps(steps: readonly Rebaseable[], over: readonly Step[], transform: Transform) {
+  const base = transform.steps.length
   for (let i = steps.length - 1; i >= 0; i--) transform.step(steps[i].inverted)
   for (let i = 0; i < over.length; i++) transform.step(over[i])
   let result = []
-  for (let i = 0, mapFrom = steps.length; i < steps.length; i++) {
+  for (let i = 0, mapFrom = base + steps.length; i < steps.length; i++) {
     let mapped = steps[i].step.map(transform.mapping.slice(mapFrom))
     mapFrom--
     if (mapped && !transform.maybeStep(mapped).failed) {

@@ -8,7 +8,7 @@ import {Node, Schema} from "prosemirror-model"
 import {Mapping, Step} from "prosemirror-transform"
 import {schema, eq, doc, p} from "prosemirror-test-builder"
 
-import {collab, Commit, receiveCommitTransaction, sendableCommit} from "./collab-commit.js"
+import {chainCommitTransaction, collab, Commit, receiveCommitTransaction, sendableCommit} from "./collab-commit.js"
 import { applyCommitJSON, schemaSerialize, schemaToJson } from './apply-commit.js'
 
 const histPlugin = history()
@@ -139,6 +139,12 @@ class DummyServer {
     this.delayed.pop()
     this.broadcast(n)
   }
+}
+
+/** Commits the server holds beyond what node n has seen, in the node's schema. */
+function pendingCommits(s: DummyServer, n: number) {
+  const version = s.plugins[n].getState(s.states[n]).version
+  return s.commits.slice(version).map(c => c.toSchema(s.states[n].schema))
 }
 
 function sel(near: number) {
@@ -303,5 +309,35 @@ describe("collab-commit", () => {
     s.conv(doc(p("A"), p("Bxy")))
     s.undo(1)
     s.conv(doc(p("A"), p("B")))
+  })
+
+  it.each([2, 3, 5])("applies %i remote commits in one transaction over unsent local steps", (count) => {
+    const batched = new DummyServer
+    const oneByOne = new DummyServer
+
+    for (const s of [batched, oneByOne]) {
+      for (let i = 0; i < count; i++) {
+        s.states[0] = s.states[0].apply(s.states[0].tr.insertText("ABCDE"[i], 1 + i))
+        s.send(0)
+        s.sync(0)
+      }
+      s.states[1] = s.states[1].apply(s.states[1].tr.insertText("X", 1))
+    }
+
+    const commits = pendingCommits(batched, 1)
+    expect(commits).toHaveLength(count)
+    let tr = receiveCommitTransaction(batched.states[1], commits[0])
+    for (const commit of commits.slice(1)) {
+      tr = chainCommitTransaction(batched.states[1], tr, commit)
+    }
+    const batchedState = batched.states[1].apply(tr)
+
+    let sequential = oneByOne.states[1]
+    for (const commit of pendingCommits(oneByOne, 1)) {
+      sequential = sequential.apply(receiveCommitTransaction(sequential, commit))
+    }
+
+    expect(batchedState.doc).toEqual(sequential.doc)
+    expect(batchedState.doc.textContent).toContain("X")
   })
 })
