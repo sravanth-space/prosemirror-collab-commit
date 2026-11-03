@@ -215,6 +215,21 @@ export function receiveCommitTransaction(
   return chainCommitTransaction(state, tr, commit, options)
 }
 
+const chainKey = "collab-commit:chain"
+
+type ChainedCommit = { commit: Commit, ack: boolean }
+
+/**
+ * Receive `commit` on top of the commits already received into `tr`, and
+ * return the transaction to dispatch. A chained call returns a new
+ * transaction, so always use the return value.
+ *
+ * prosemirror-history can rebase its undo stack over one rebase per
+ * transaction: the unconfirmed steps inverted first, then the remote steps,
+ * then the unconfirmed steps re-applied. So every chained call rebuilds the
+ * whole chain from `state` in that shape instead of appending a second
+ * rebase to `tr`.
+ */
 export function chainCommitTransaction(
   state: EditorState,
   tr: Transaction,
@@ -223,11 +238,94 @@ export function chainCommitTransaction(
     mapSelectionBackward?: boolean
   }
 ) {
+  const collabState = tr.getMeta(collabKey) as CollabState
+  if (collabState.nextVersion != commit.version) return tr
+
+  const chain: ChainedCommit[] | undefined = tr.getMeta(chainKey)
+  // A transaction that already holds steps of its own can't be rebuilt.
+  if (!chain && tr.steps.length) return appendCommit(state, tr, commit, options)
+
+  const ack = commit.ref == collabState.commit?.ref
+  return buildChain(state, [...(chain ?? []), { commit, ack }], options)
+}
+
+function buildChain(
+  state: EditorState,
+  chain: ChainedCommit[],
+  options?: { mapSelectionBackward?: boolean }
+) {
+  const start = collabKey.getState(state) as CollabState
+  let version = start.version
+  let uncommitted = start.commit
+  let unconfirmed = start.unconfirmed
+
+  // Acks before any remote commit only confirm steps; nothing is rebased.
+  let first = 0
+  while (first < chain.length && chain[first].ack) {
+    unconfirmed = unconfirmed.slice(chain[first].commit.steps.length)
+    uncommitted = undefined
+    version++
+    first++
+  }
+  let last = chain.length - 1
+  while (last >= first && chain[last].ack) last--
+
+  const tr = state.tr
+  if (last < first) {
+    return tr.setMeta(chainKey, chain).setMeta(collabKey, new CollabState(version, unconfirmed))
+  }
+
+  const n = unconfirmed.length
+  for (let i = n - 1; i >= 0; i--) tr.step(unconfirmed[i].inverted)
+
+  // An ack between remote commits lands in the server's order like a remote
+  // commit. Its steps drop out of the undo stack: history only rebases one
+  // run of re-applied steps, and remote commits follow these.
+  let confirmed = 0
+  for (let i = first; i <= last; i++) {
+    const { commit, ack } = chain[i]
+    commit.steps.forEach(step => tr.step(step))
+    if (ack) {
+      confirmed += commit.steps.length
+      uncommitted = undefined
+    }
+    version++
+  }
+
+  let rebased: Rebaseable[] = []
+  for (let i = 0, mapFrom = n; i < n; i++) {
+    const mapped = i < confirmed ? null : unconfirmed[i].step.map(tr.mapping.slice(mapFrom))
+    mapFrom--
+    if (mapped && !tr.maybeStep(mapped).failed) {
+      // @ts-ignore
+      tr.mapping.setMirror(mapFrom, tr.steps.length - 1)
+      rebased.push(new Rebaseable(mapped, mapped.invert(tr.docs[tr.docs.length - 1]), unconfirmed[i].origin))
+    }
+  }
+
+  // Acks after the last remote commit confirm steps that were just re-applied.
+  for (let i = last + 1; i < chain.length; i++) {
+    rebased = rebased.slice(chain[i].commit.steps.length)
+    uncommitted = undefined
+    version++
+  }
+
+  mapSelection(state, tr, options)
+  return tr.setMeta(chainKey, chain)
+    .setMeta("rebased", n)
+    .setMeta("addToHistory", false)
+    .setMeta(collabKey, new CollabState(version, rebased, uncommitted))
+}
+
+function appendCommit(
+  state: EditorState,
+  tr: Transaction,
+  commit: Commit,
+  options?: { mapSelectionBackward?: boolean }
+) {
   let collabState = tr.getMeta(collabKey) as CollabState
   let { nextVersion, unconfirmed = [], commit: uncommited } = collabState
   const nUnconfirmed = unconfirmed.length
-
-  if (nextVersion != commit.version) return tr
 
   if (commit.ref == uncommited?.ref) {
     return tr.setMeta(collabKey, new CollabState(nextVersion, unconfirmed.slice(commit.steps.length)))
@@ -235,18 +333,17 @@ export function chainCommitTransaction(
 
   unconfirmed = rebaseSteps(unconfirmed, commit.steps, tr)
 
-  const newCollabState = new CollabState(
-    nextVersion,
-    unconfirmed,
-    uncommited
-  )
+  mapSelection(state, tr, options)
+  return tr.setMeta("rebased", nUnconfirmed).setMeta("addToHistory", false)
+    .setMeta(collabKey, new CollabState(nextVersion, unconfirmed, uncommited))
+}
 
+function mapSelection(state: EditorState, tr: Transaction, options?: { mapSelectionBackward?: boolean }) {
   if (options?.mapSelectionBackward && state.selection instanceof TextSelection) {
     tr.setSelection(TextSelection.between(tr.doc.resolve(tr.mapping.map(state.selection.anchor, -1)),
                                           tr.doc.resolve(tr.mapping.map(state.selection.head, -1)), -1))
     ;(tr as any).updated &= ~1
   }
-  return tr.setMeta("rebased", nUnconfirmed).setMeta("addToHistory", false).setMeta(collabKey, newCollabState)
 }
 
 export function sendableCommit(state: EditorState, maxSteps = 20): Commit | null {

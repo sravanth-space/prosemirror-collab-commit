@@ -360,4 +360,66 @@ describe("collab-commit", () => {
 
     expect(s.states[1].doc.textContent).toBe("ABCDE".slice(0, count))
   })
+
+  function receiveChained(s: DummyServer, n: number) {
+    const commits = pendingCommits(s, n)
+    let tr = receiveCommitTransaction(s.states[n], commits[0])
+    for (const commit of commits.slice(1)) {
+      tr = chainCommitTransaction(s.states[n], tr, commit)
+    }
+    s.states[n] = s.states[n].apply(tr)
+  }
+
+  function receiveOneByOne(s: DummyServer, n: number) {
+    for (const commit of pendingCommits(s, n)) {
+      s.states[n] = s.states[n].apply(receiveCommitTransaction(s.states[n], commit))
+    }
+  }
+
+  it("matches one at a time when our own commit is acked at the end of the chain", () => {
+    const [chained, oneByOne] = [new DummyServer, new DummyServer].map(s => {
+      s.states[1] = s.states[1].apply(s.states[1].tr.insertText("X", 1))
+      s.states[1] = s.states[1].apply(closeHistory(s.states[1].tr))
+      s.states[0] = s.states[0].apply(s.states[0].tr.insertText("A", 1))
+      s.send(0)
+      s.sync(0)
+      s.states[0] = s.states[0].apply(s.states[0].tr.insertText("B", 2))
+      s.send(0)
+      s.sync(0)
+      s.send(1)
+      s.states[1] = s.states[1].apply(s.states[1].tr.insertText("Y", s.states[1].doc.content.size - 1))
+      return s
+    })
+    receiveChained(chained, 1)
+    receiveOneByOne(oneByOne, 1)
+    expect(chained.states[1].doc).toEqual(oneByOne.states[1].doc)
+    expect([...chained.states[1].doc.textContent].sort().join("")).toBe("ABXY")
+
+    for (let i = 0; i < 2; i++) {
+      chained.undo(1)
+      oneByOne.undo(1)
+      expect(chained.states[1].doc.textContent).toBe(oneByOne.states[1].doc.textContent)
+    }
+  })
+
+  it("matches one at a time when our own commit is acked between remote commits", () => {
+    const [chained, oneByOne] = [new DummyServer, new DummyServer].map(s => {
+      s.states[0] = s.states[0].apply(s.states[0].tr.insertText("A", 1))
+      s.send(0)
+      s.sync(0)
+      s.states[1] = s.states[1].apply(s.states[1].tr.insertText("X", 1))
+      s.send(1)
+      s.states[0] = s.states[0].apply(s.states[0].tr.insertText("B", 2))
+      s.send(0)
+      return s
+    })
+    receiveChained(chained, 1)
+    receiveOneByOne(oneByOne, 1)
+    expect(chained.states[1].doc).toEqual(oneByOne.states[1].doc)
+    expect([...chained.states[1].doc.textContent].sort().join("")).toBe("ABX")
+
+    chained.undo(1)
+    expect(chained.states[1].doc.textContent).toContain("A")
+    expect(chained.states[1].doc.textContent).toContain("B")
+  })
 })
