@@ -340,4 +340,24 @@ describe("collab-commit", () => {
     expect(batchedState.doc).toEqual(sequential.doc)
     expect(batchedState.doc.textContent).toContain("X")
   })
+
+  it.each([2, 3])("undoes only the local step after %i remote commits in one transaction", (count) => {
+    const s = new DummyServer
+    for (let i = 0; i < count; i++) {
+      s.states[0] = s.states[0].apply(s.states[0].tr.insertText("ABCDE"[i], 1 + i))
+      s.send(0)
+      s.sync(0)
+    }
+    s.states[1] = s.states[1].apply(s.states[1].tr.insertText("X", 1))
+
+    const commits = pendingCommits(s, 1)
+    let tr = receiveCommitTransaction(s.states[1], commits[0])
+    for (const commit of commits.slice(1)) {
+      tr = chainCommitTransaction(s.states[1], tr, commit)
+    }
+    s.states[1] = s.states[1].apply(tr)
+    s.undo(1)
+
+    expect(s.states[1].doc.textContent).toBe("ABCDE".slice(0, count))
+  })
 })
